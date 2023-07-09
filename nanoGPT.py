@@ -17,17 +17,21 @@ itos = {i: c for i, c in enumerate(chars)}
 encode = lambda s: [stoi[c] for c in s]
 decode = lambda s: "".join([itos[i] for i in s])
 decode(encode("salut"))
+n_embd = 32  # number of embedding dimension
 
 # create the datasets
 data = torch.tensor(data=encode(text), dtype=torch.int64)
-n = int(len(data))
+n = int(len(data)) // 10 * 9
 train_data = data[:n]
 val_data = data[n:]
 
 # hyperparameters
 block_size = 8
 batch_size = 32
-steps = 10000
+steps = 1000
+# steps = 10000
+eval_iters = 200
+eval_interval = 300
 
 
 # helper functions
@@ -39,19 +43,45 @@ def get_batch(split="train"):
     return x, y
 
 
+@torch.no_grad()
+def estimate_loss():
+    out = {}
+    model.eval()  # set the model in evaluation mode
+    for split in ["train", "val"]:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, Y = get_batch(split)
+            logits, loss = model(X, Y)
+            losses[k] = loss.item()
+            out[split] = losses.mean()
+    model.train()  # set the model in training mode
+    return out
+
+
 # Create a class for the language model
 class BigramLanguageModel(nn.Module):
-    def __init__(self, vocab_size: int):
+    def __init__(self):
         super().__init__()
         # lookup table: each token looks directly for the next following one
         self.token_embedding_table = nn.Embedding(
-            num_embeddings=vocab_size, embedding_dim=vocab_size
+            num_embeddings=vocab_size, embedding_dim=n_embd
         )
+        self.position_embedding_table = nn.Embedding(
+            num_embeddings=block_size, embedding_dim=n_embd
+        )
+        self.lm_head = nn.Linear(in_features=n_embd, out_features=vocab_size)
 
     def forward(self, inputs: torch.Tensor, targets=None):
-        logits: torch.Tensor = self.token_embedding_table(
+        B, T = inputs.shape
+        tok_embd: torch.Tensor = self.token_embedding_table(
             inputs
-        )  # Tensor of size B, T and C
+        )  # Tensor of size B, T and C (n_embd)
+        pos_embd: torch.Tensor = self.position_embedding_table(
+            torch.arange(T)
+        )  # Tensor of size (T, C=n_embd)
+        x = tok_embd + pos_embd  # broadcasting pos_embd: (T, C) -> (B, T, C)
+        logits: torch.Tensor = self.lm_head(x)  # Tensor of size B, T and C (vocab_size)
+
         if targets is None:
             loss = torch.zeros(size=(0,))
         else:
@@ -80,7 +110,7 @@ class BigramLanguageModel(nn.Module):
 
 
 # instance of a bigram model
-model = BigramLanguageModel(vocab_size=vocab_size)
+model = BigramLanguageModel()
 
 
 # helper function: sample from model
@@ -97,7 +127,7 @@ def sample(
 optimizer = torch.optim.Adam(params=model.parameters(), lr=1e-3)
 # optimize the model
 loss = torch.zeros(size=())
-for _ in range(steps):
+for step in range(steps):
     # get a new batch sample
     xb, yb = get_batch()
     # forward pass
@@ -106,6 +136,11 @@ for _ in range(steps):
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
+    # check loss from time to time
+    if step % eval_interval == 0:
+        losses = estimate_loss()
+        print(
+            f"Loss on training set = {losses['train']}; loss on validation set = {losses['val']}"
+        )
 
-print(f"Loss = {loss.item()}")
 print(sample(maxNewToken=300))
