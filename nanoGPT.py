@@ -73,6 +73,7 @@ class BigramLanguageModel(nn.Module):
 
     def forward(self, inputs: torch.Tensor, targets=None):
         B, T = inputs.shape
+
         tok_embd: torch.Tensor = self.token_embedding_table(
             inputs
         )  # Tensor of size B, T and C (n_embd)
@@ -96,8 +97,8 @@ class BigramLanguageModel(nn.Module):
     def generate(self, idx: torch.Tensor, maxNewTokens: int):
         # idx is the (B, T) arrays of indices in the current context
         for _ in range(maxNewTokens):
-            # gets the prediction
-            logits, loss = self.forward(inputs=idx)
+            # gets the prediction TODO self added correction, to be checked during lecture
+            logits, loss = self.forward(inputs=idx[:, -block_size:])
             # focus on the last one -> dim becomes (B,C)
             logits = logits[:, -1, :]
             # translate to probabilities
@@ -105,7 +106,8 @@ class BigramLanguageModel(nn.Module):
             # sample (1 sample) from the probabilities
             new_idx = probs.multinomial(num_samples=1, replacement=True)  # (B, 1)
             # complete the existing string of indices
-            idx = torch.cat(tensors=(idx, new_idx), dim=1)  # (B, T+1)
+            idx = torch.cat(tensors=(idx, new_idx), dim=1)
+
         return idx
 
 
@@ -117,7 +119,7 @@ model = BigramLanguageModel()
 def sample(
     model=model, context=torch.zeros(size=(1, 1), dtype=torch.int64), maxNewToken=100
 ):
-    idx = torch.zeros(size=(1, 1), dtype=torch.int64)
+    idx = context
     prediction = model.generate(idx=idx, maxNewTokens=maxNewToken).view(-1)
     return decode([i.item() for i in prediction])
 
