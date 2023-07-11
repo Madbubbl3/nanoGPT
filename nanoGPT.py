@@ -18,6 +18,7 @@ encode = lambda s: [stoi[c] for c in s]
 decode = lambda s: "".join([itos[i] for i in s])
 decode(encode("salut"))
 n_embd = 32  # number of embedding dimension
+head_size = n_embd
 
 # create the datasets
 data = torch.tensor(data=encode(text), dtype=torch.int64)
@@ -28,10 +29,11 @@ val_data = data[n:]
 # hyperparameters
 block_size = 8
 batch_size = 32
-steps = 1000
-# steps = 10000
+# steps = 1000
+steps = 5000
 eval_iters = 200
-eval_interval = 300
+eval_interval = 500
+learning_rate = 1e-3
 
 
 # helper functions
@@ -58,6 +60,47 @@ def estimate_loss():
     return out
 
 
+# Create an attention head layer
+class Head(nn.Module):
+    """Implementation of a single head of self attention"""
+
+    def __init__(self, fan_in: int = n_embd, fan_out: int = head_size) -> None:
+        super().__init__()
+        self.query = nn.Linear(
+            in_features=fan_in, out_features=fan_out, bias=False
+        )  # (fan_in,fan_out)
+        self.key = nn.Linear(
+            in_features=fan_in, out_features=fan_out, bias=False
+        )  # (fan_in,fan_out)
+        self.value = nn.Linear(
+            in_features=fan_in, out_features=fan_out, bias=False
+        )  # (fan_in,fan_out)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        q = self.query(x)  # (batch_size, n_embd, head_size)
+        k = self.key(x)  # (batch_size, n_embd, head_size)
+        v = self.value(x)  # (batch_size, n_embd, head_size)
+        tril = torch.tril(torch.ones(size=(T, T)))
+        wei = q @ k.transpose(-2, -1) * C**-0.5  # (batch_size, n_embd, n_emd)
+        wei = wei.masked_fill(mask=tril == 0, value=float("-inf"))
+        # wei = wei.masked_fill(mask=self.tril[:T, :T] == 0, fill=float("-inf"))
+        wei = F.softmax(input=wei, dim=-1)  # (B, T, T)
+        out = wei @ v  # (B, T, C)
+        return out
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, n_heads: int, head_size: int) -> None:
+        super().__init__()
+        self.heads = nn.ModuleList(
+            modules=[Head(fan_out=head_size) for _ in range(n_heads)]
+        )
+
+    def forward(self, x):
+        return torch.cat([h(x) for h in self.heads], dim=-1)
+
+
 # Create a class for the language model
 class BigramLanguageModel(nn.Module):
     def __init__(self):
@@ -69,6 +112,7 @@ class BigramLanguageModel(nn.Module):
         self.position_embedding_table = nn.Embedding(
             num_embeddings=block_size, embedding_dim=n_embd
         )
+        self.sa_heads = MultiHeadAttention(n_heads=4, head_size=n_embd // 4)
         self.lm_head = nn.Linear(in_features=n_embd, out_features=vocab_size)
 
     def forward(self, inputs: torch.Tensor, targets=None):
@@ -81,6 +125,7 @@ class BigramLanguageModel(nn.Module):
             torch.arange(T)
         )  # Tensor of size (T, C=n_embd)
         x = tok_embd + pos_embd  # broadcasting pos_embd: (T, C) -> (B, T, C)
+        x = self.sa_heads(x)
         logits: torch.Tensor = self.lm_head(x)  # Tensor of size B, T and C (vocab_size)
 
         if targets is None:
@@ -97,7 +142,6 @@ class BigramLanguageModel(nn.Module):
     def generate(self, idx: torch.Tensor, maxNewTokens: int):
         # idx is the (B, T) arrays of indices in the current context
         for _ in range(maxNewTokens):
-            # gets the prediction TODO self added correction, to be checked during lecture
             logits, loss = self.forward(inputs=idx[:, -block_size:])
             # focus on the last one -> dim becomes (B,C)
             logits = logits[:, -1, :]
@@ -126,7 +170,7 @@ def sample(
 
 # optimization
 # create an optimizer object
-optimizer = torch.optim.Adam(params=model.parameters(), lr=1e-3)
+optimizer = torch.optim.Adam(params=model.parameters(), lr=learning_rate)
 # optimize the model
 loss = torch.zeros(size=())
 for step in range(steps):
