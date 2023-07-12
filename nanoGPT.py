@@ -1,3 +1,4 @@
+"""import libraries and data"""
 # import necessary libraries
 import torch
 import torch.nn as nn
@@ -18,7 +19,8 @@ encode = lambda s: [stoi[c] for c in s]
 decode = lambda s: "".join([itos[i] for i in s])
 decode(encode("salut"))
 n_embd = 32  # number of embedding dimension
-head_size = n_embd
+n_head = 4
+head_size = n_embd // n_head
 
 # create the datasets
 data = torch.tensor(data=encode(text), dtype=torch.int64)
@@ -26,7 +28,8 @@ n = int(len(data)) // 10 * 9
 train_data = data[:n]
 val_data = data[n:]
 
-# hyperparameters
+# -----------------------------------------------------------------------------------------------------------------------------
+"""Hyperparameters"""
 block_size = 8
 batch_size = 32
 # steps = 1000
@@ -35,8 +38,10 @@ eval_iters = 200
 eval_interval = 500
 learning_rate = 1e-3
 
+# -----------------------------------------------------------------------------------------------------------------------------
+"""helper functions"""
 
-# helper functions
+
 def get_batch(split="train"):
     data = train_data if split == "train" else val_data
     ix = torch.randint(low=0, high=(len(data) - block_size), size=(batch_size,))
@@ -60,21 +65,21 @@ def estimate_loss():
     return out
 
 
-# Create an attention head layer
+# -----------------------------------------------------------------------------------------------------------------------------
+"""Build the Model"""
+
+
 class Head(nn.Module):
     """Implementation of a single head of self attention"""
 
     def __init__(self, fan_in: int = n_embd, fan_out: int = head_size) -> None:
         super().__init__()
-        self.query = nn.Linear(
-            in_features=fan_in, out_features=fan_out, bias=False
-        )  # (fan_in,fan_out)
-        self.key = nn.Linear(
-            in_features=fan_in, out_features=fan_out, bias=False
-        )  # (fan_in,fan_out)
-        self.value = nn.Linear(
-            in_features=fan_in, out_features=fan_out, bias=False
-        )  # (fan_in,fan_out)
+        # (fan_in,fan_out)
+        self.query = nn.Linear(in_features=fan_in, out_features=fan_out, bias=False)
+        # (fan_in,fan_out)
+        self.key = nn.Linear(in_features=fan_in, out_features=fan_out, bias=False)
+        # dim =(fan_in,fan_out)
+        self.value = nn.Linear(in_features=fan_in, out_features=fan_out, bias=False)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -91,18 +96,54 @@ class Head(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
+    """Implementation of multiple heads of attention"""
+
     def __init__(self, n_heads: int, head_size: int) -> None:
         super().__init__()
         self.heads = nn.ModuleList(
             modules=[Head(fan_out=head_size) for _ in range(n_heads)]
         )
+        self.proj = nn.Linear(n_embd, n_embd)
+
+    def forward(self, x: torch.Tensor):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out)
+        return out
+
+
+class FeedForward(nn.Module):
+    def __init__(self, n_embd: int = n_embd) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_features=n_embd, out_features=n_embd * 4),
+            nn.ReLU(),
+            nn.Linear(in_features=n_embd * 4, out_features=n_embd),
+        )
 
     def forward(self, x):
-        return torch.cat([h(x) for h in self.heads], dim=-1)
+        return self.net(x)
 
 
-# Create a class for the language model
+class Block(nn.Module):
+    """one transformer block: communication followed by computation"""
+
+    def __init__(self, n_emb: int = n_embd, n_head: int = n_head) -> None:
+        super().__init__()
+        head_size = n_emb // n_head
+        self.sa = MultiHeadAttention(n_heads=n_head, head_size=head_size)
+        self.ffw = FeedForward(n_embd=n_emb)
+        self.ln1 = nn.LayerNorm(normalized_shape=n_emb)
+        self.ln2 = nn.LayerNorm(normalized_shape=n_emb)
+
+    def forward(self, x: torch.Tensor):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffw(self.ln2(x))
+        return x
+
+
 class BigramLanguageModel(nn.Module):
+    """Implementation of our language model"""
+
     def __init__(self):
         super().__init__()
         # lookup table: each token looks directly for the next following one
@@ -112,20 +153,23 @@ class BigramLanguageModel(nn.Module):
         self.position_embedding_table = nn.Embedding(
             num_embeddings=block_size, embedding_dim=n_embd
         )
-        self.sa_heads = MultiHeadAttention(n_heads=4, head_size=n_embd // 4)
+        # self.sa_heads = MultiHeadAttention(n_heads=4, head_size=n_embd // 4)
+        self.block = nn.Sequential(
+            Block(n_emb=n_embd, n_head=n_head),
+            Block(n_emb=n_embd, n_head=n_head),
+            Block(n_emb=n_embd, n_head=n_head),
+            nn.LayerNorm(normalized_shape=n_embd),
+        )
         self.lm_head = nn.Linear(in_features=n_embd, out_features=vocab_size)
 
     def forward(self, inputs: torch.Tensor, targets=None):
         B, T = inputs.shape
-
-        tok_embd: torch.Tensor = self.token_embedding_table(
-            inputs
-        )  # Tensor of size B, T and C (n_embd)
-        pos_embd: torch.Tensor = self.position_embedding_table(
-            torch.arange(T)
-        )  # Tensor of size (T, C=n_embd)
+        # Tensor of size B, T and C (n_embd)
+        tok_embd: torch.Tensor = self.token_embedding_table(inputs)
+        # Tensor of size (T, C=n_embd)
+        pos_embd: torch.Tensor = self.position_embedding_table(torch.arange(T))
         x = tok_embd + pos_embd  # broadcasting pos_embd: (T, C) -> (B, T, C)
-        x = self.sa_heads(x)
+        x = self.block(x)
         logits: torch.Tensor = self.lm_head(x)  # Tensor of size B, T and C (vocab_size)
 
         if targets is None:
@@ -155,20 +199,11 @@ class BigramLanguageModel(nn.Module):
         return idx
 
 
+# -----------------------------------------------------------------------------------------------------------------------------
+"""create and optimize the model"""
+
 # instance of a bigram model
 model = BigramLanguageModel()
-
-
-# helper function: sample from model
-def sample(
-    model=model, context=torch.zeros(size=(1, 1), dtype=torch.int64), maxNewToken=100
-):
-    idx = context
-    prediction = model.generate(idx=idx, maxNewTokens=maxNewToken).view(-1)
-    return decode([i.item() for i in prediction])
-
-
-# optimization
 # create an optimizer object
 optimizer = torch.optim.Adam(params=model.parameters(), lr=learning_rate)
 # optimize the model
@@ -188,5 +223,18 @@ for step in range(steps):
         print(
             f"Loss on training set = {losses['train']}; loss on validation set = {losses['val']}"
         )
+# -----------------------------------------------------------------------------------------------------------------------------
+"""sample from the model"""
 
+
+# helper function: sample from model
+def sample(
+    model=model, context=torch.zeros(size=(1, 1), dtype=torch.int64), maxNewToken=100
+):
+    idx = context
+    prediction = model.generate(idx=idx, maxNewTokens=maxNewToken).view(-1)
+    return decode([i.item() for i in prediction])
+
+
+# sample from the model
 print(sample(maxNewToken=300))
