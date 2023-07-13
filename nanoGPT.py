@@ -18,9 +18,7 @@ itos = {i: c for i, c in enumerate(chars)}
 encode = lambda s: [stoi[c] for c in s]
 decode = lambda s: "".join([itos[i] for i in s])
 decode(encode("salut"))
-n_embd = 32  # number of embedding dimension
-n_head = 4
-head_size = n_embd // n_head
+
 
 # create the datasets
 data = torch.tensor(data=encode(text), dtype=torch.int64)
@@ -30,13 +28,17 @@ val_data = data[n:]
 
 # -----------------------------------------------------------------------------------------------------------------------------
 """Hyperparameters"""
-block_size = 8
-batch_size = 32
-# steps = 1000
-steps = 5000
-eval_iters = 200
+block_size = 64
+batch_size = 256
+steps = 5000  # = max_iters
 eval_interval = 500
-learning_rate = 1e-3
+learning_rate = 3e-4
+eval_iters = 200
+n_embd = 384  # number of embedding dimension
+n_head = 6
+n_layers = 6
+head_size = n_embd // n_head
+dropout = 0.2
 
 # -----------------------------------------------------------------------------------------------------------------------------
 """helper functions"""
@@ -80,8 +82,9 @@ class Head(nn.Module):
         self.key = nn.Linear(in_features=fan_in, out_features=fan_out, bias=False)
         # dim =(fan_in,fan_out)
         self.value = nn.Linear(in_features=fan_in, out_features=fan_out, bias=False)
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
         q = self.query(x)  # (batch_size, n_embd, head_size)
         k = self.key(x)  # (batch_size, n_embd, head_size)
@@ -91,7 +94,9 @@ class Head(nn.Module):
         wei = wei.masked_fill(mask=tril == 0, value=float("-inf"))
         # wei = wei.masked_fill(mask=self.tril[:T, :T] == 0, fill=float("-inf"))
         wei = F.softmax(input=wei, dim=-1)  # (B, T, T)
+        wei = self.dropout(wei)
         out = wei @ v  # (B, T, C)
+
         return out
 
 
@@ -104,10 +109,12 @@ class MultiHeadAttention(nn.Module):
             modules=[Head(fan_out=head_size) for _ in range(n_heads)]
         )
         self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
         out = self.proj(out)
+        out = self.dropout(out)
         return out
 
 
@@ -118,9 +125,10 @@ class FeedForward(nn.Module):
             nn.Linear(in_features=n_embd, out_features=n_embd * 4),
             nn.ReLU(),
             nn.Linear(in_features=n_embd * 4, out_features=n_embd),
+            nn.Dropout(p=dropout),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
 
@@ -154,12 +162,10 @@ class BigramLanguageModel(nn.Module):
             num_embeddings=block_size, embedding_dim=n_embd
         )
         # self.sa_heads = MultiHeadAttention(n_heads=4, head_size=n_embd // 4)
-        self.block = nn.Sequential(
-            Block(n_emb=n_embd, n_head=n_head),
-            Block(n_emb=n_embd, n_head=n_head),
-            Block(n_emb=n_embd, n_head=n_head),
-            nn.LayerNorm(normalized_shape=n_embd),
+        self.blocks = nn.Sequential(
+            *[Block(n_emb=n_embd, n_head=n_head) for _ in range(n_layers)]
         )
+        self.ln_f = nn.LayerNorm(n_embd)  # final normalisation layer
         self.lm_head = nn.Linear(in_features=n_embd, out_features=vocab_size)
 
     def forward(self, inputs: torch.Tensor, targets=None):
@@ -169,7 +175,8 @@ class BigramLanguageModel(nn.Module):
         # Tensor of size (T, C=n_embd)
         pos_embd: torch.Tensor = self.position_embedding_table(torch.arange(T))
         x = tok_embd + pos_embd  # broadcasting pos_embd: (T, C) -> (B, T, C)
-        x = self.block(x)
+        x = self.blocks(x)
+        x = self.ln_f(x)
         logits: torch.Tensor = self.lm_head(x)  # Tensor of size B, T and C (vocab_size)
 
         if targets is None:
