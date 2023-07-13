@@ -7,7 +7,9 @@ import torch.nn.functional as F
 torch.manual_seed(1337)
 
 # load the data
-with open(file="datasets/tinyshakespear.txt", mode="r", encoding="utf-8") as file:
+path = "datasets/tinyshakespear.txt"
+# path = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+with open(file=path, mode="r", encoding="utf-8") as file:
     text = file.read()
 
 # create the encoder and decoder
@@ -19,6 +21,14 @@ encode = lambda s: [stoi[c] for c in s]
 decode = lambda s: "".join([itos[i] for i in s])
 decode(encode("salut"))
 
+# activate GPU if available
+device = "cpu"
+if torch.cuda.is_available():
+    print("training on GPU: CUDA")
+    device = "cuda"
+if torch.backends.mps.is_available():
+    print("training on GPU: Apple Metal")
+    device = "mps"
 
 # create the datasets
 data = torch.tensor(data=encode(text), dtype=torch.int64)
@@ -26,21 +36,23 @@ n = int(len(data)) // 10 * 9
 train_data = data[:n]
 val_data = data[n:]
 
-# -----------------------------------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------------------------
 """Hyperparameters"""
 block_size = 64
-batch_size = 256
+batch_size = 128
 steps = 5000  # = max_iters
+# steps = 50  # = max_iters
+# steps = 0  # = max_iters
 eval_interval = 500
 learning_rate = 3e-4
 eval_iters = 200
-n_embd = 384  # number of embedding dimension
+n_embd = 198  # number of embedding dimension
 n_head = 6
 n_layers = 6
 head_size = n_embd // n_head
 dropout = 0.2
 
-# -----------------------------------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------------------------
 """helper functions"""
 
 
@@ -49,9 +61,11 @@ def get_batch(split="train"):
     ix = torch.randint(low=0, high=(len(data) - block_size), size=(batch_size,))
     x = torch.stack(tensors=[data[i : (i + block_size)] for i in ix])
     y = torch.stack(tensors=[data[i + 1 : i + block_size + 1] for i in ix])
+    x, y = x.to(device=device), y.to(device=device)
     return x, y
 
 
+# estimate the loss
 @torch.no_grad()
 def estimate_loss():
     out = {}
@@ -67,7 +81,12 @@ def estimate_loss():
     return out
 
 
-# -----------------------------------------------------------------------------------------------------------------------------
+# print the number of parameters of the model
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+# --------------------------------------------------------------------------------------------------------------------
 """Build the Model"""
 
 
@@ -82,6 +101,9 @@ class Head(nn.Module):
         self.key = nn.Linear(in_features=fan_in, out_features=fan_out, bias=False)
         # dim =(fan_in,fan_out)
         self.value = nn.Linear(in_features=fan_in, out_features=fan_out, bias=False)
+        self.register_buffer(
+            name="tril", tensor=torch.tril(torch.ones(size=(block_size, block_size)))
+        )
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -89,10 +111,10 @@ class Head(nn.Module):
         q = self.query(x)  # (batch_size, n_embd, head_size)
         k = self.key(x)  # (batch_size, n_embd, head_size)
         v = self.value(x)  # (batch_size, n_embd, head_size)
-        tril = torch.tril(torch.ones(size=(T, T)))
+
         wei = q @ k.transpose(-2, -1) * C**-0.5  # (batch_size, n_embd, n_emd)
-        wei = wei.masked_fill(mask=tril == 0, value=float("-inf"))
-        # wei = wei.masked_fill(mask=self.tril[:T, :T] == 0, fill=float("-inf"))
+        # wei = wei.masked_fill(mask=self.tril == 0, value=float("-inf"))
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
         wei = F.softmax(input=wei, dim=-1)  # (B, T, T)
         wei = self.dropout(wei)
         out = wei @ v  # (B, T, C)
@@ -149,7 +171,7 @@ class Block(nn.Module):
         return x
 
 
-class BigramLanguageModel(nn.Module):
+class GPTLanguageModel(nn.Module):
     """Implementation of our language model"""
 
     def __init__(self):
@@ -173,7 +195,9 @@ class BigramLanguageModel(nn.Module):
         # Tensor of size B, T and C (n_embd)
         tok_embd: torch.Tensor = self.token_embedding_table(inputs)
         # Tensor of size (T, C=n_embd)
-        pos_embd: torch.Tensor = self.position_embedding_table(torch.arange(T))
+        pos_embd: torch.Tensor = self.position_embedding_table(
+            torch.arange(T, device=device)
+        )
         x = tok_embd + pos_embd  # broadcasting pos_embd: (T, C) -> (B, T, C)
         x = self.blocks(x)
         x = self.ln_f(x)
@@ -206,13 +230,16 @@ class BigramLanguageModel(nn.Module):
         return idx
 
 
-# -----------------------------------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------------------------
 """create and optimize the model"""
 
 # instance of a bigram model
-model = BigramLanguageModel()
+model = GPTLanguageModel()
+model = model.to(device=device)
 # create an optimizer object
 optimizer = torch.optim.Adam(params=model.parameters(), lr=learning_rate)
+# print the number of parameters of the model
+print(f"Number of parameters of the Model: {count_parameters(model=model) / 1e6} Mio.")
 # optimize the model
 loss = torch.zeros(size=())
 for step in range(steps):
@@ -228,15 +255,19 @@ for step in range(steps):
     if step % eval_interval == 0:
         losses = estimate_loss()
         print(
-            f"Loss on training set = {losses['train']}; loss on validation set = {losses['val']}"
+            f"Step {step}: Loss on training set = {losses['train']}; loss on validation set = {losses['val']}"
         )
-# -----------------------------------------------------------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------------------------------------------------
 """sample from the model"""
 
 
 # helper function: sample from model
 def sample(
-    model=model, context=torch.zeros(size=(1, 1), dtype=torch.int64), maxNewToken=100
+    model=model,
+    context=torch.zeros(size=(1, 1), dtype=torch.int64, device=device),
+    maxNewToken=100,
 ):
     idx = context
     prediction = model.generate(idx=idx, maxNewTokens=maxNewToken).view(-1)
@@ -244,4 +275,4 @@ def sample(
 
 
 # sample from the model
-print(sample(maxNewToken=300))
+print(sample(maxNewToken=500))
